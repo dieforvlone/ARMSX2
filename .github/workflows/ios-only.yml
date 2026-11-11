@@ -1,0 +1,98 @@
+# Builds only the iOS IPA, with Xcode 27 and the iOS 27.1+ SDK.
+#
+# iOS runs an app at a device's native screen size only when the app was linked against an SDK
+# that knows that device; older-SDK apps are letterboxed. iPhone Duo's inner screen needs the
+# iOS 27.1 SDK, so this build refuses to package with anything older and checks the result.
+# Info.plist already declares UILaunchScreen and UIRequiresFullScreen, the other requirement.
+name: iOS IPA only (Xcode 27, iPhone Duo)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/ios-only.yml'
+
+concurrency:
+  group: ios-only-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    name: iOS IPA (unsigned, Xcode 27)
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v7
+
+      # Picks the newest Xcode 27 on the runner, so a 27.0 default doesn't win over 27.1+.
+      - name: Select Xcode 27
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)"
+          sudo xcode-select -switch "${XCODE:-/Applications/Xcode.app}"
+          xcodebuild -version
+          echo "iphoneos SDK $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: Require the iOS 27.1 SDK
+        run: |
+          sdk="$(xcrun --sdk iphoneos --show-sdk-version)"
+          printf '%s\n27.1\n' "$sdk" | sort -V -C -r || { echo "::error::iOS SDK $sdk is older than 27.1; the app would be letterboxed on iPhone Duo"; exit 1; }
+
+      # librashader is built by cargo for iOS; without this target CMake turns shader
+      # support off and the app hides Shaders, while the build still passes.
+      - name: Install Rust iOS target
+        run: rustup target add aarch64-apple-ios
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      # Same key recipe as nightly.yml; xcodebuild -version and the image are in it, so an
+      # Xcode 26 core is never reused here.
+      - name: Compute the core cache key
+        id: core-key
+        run: echo "key=ios-core-device-$({ xcodebuild -version; echo "${ImageOS:-}-${ImageVersion:-}"; cmake --version | head -1; ninja --version; rustc --version; git rev-parse HEAD:pcsx2 HEAD:common HEAD:3rdparty HEAD:cmake HEAD:bin/resources/shaders HEAD:platforms/android/app/src/main/cpp/3rdparty HEAD:platforms/ios/CMakeLists.txt HEAD:platforms/ios/cmake HEAD:platforms/ios/3rdparty HEAD:platforms/ios/patches HEAD:platforms/ios/scripts/build-ios-core.sh; } | shasum | cut -c1-40)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the prebuilt core
+        id: core-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: platforms/ios/build/core-device
+          key: ${{ steps.core-key.outputs.key }}
+
+      # A restored core is older than a fresh checkout, so Ninja would rebuild all of it, and a
+      # precompiled header rejects any header whose mtime differs from the one it was built with.
+      - name: Age the checkout behind the prebuilt core
+        run: find . -path ./.git -prune -o -path ./platforms/ios/build -prune -o -exec touch -h -t 200001010000 {} +
+
+      - name: Build the prebuilt core
+        run: platforms/ios/scripts/build-ios-core.sh device
+
+      - name: Save the prebuilt core
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: platforms/ios/build/core-device
+          key: ${{ steps.core-key.outputs.key }}
+
+      # Optional: without the IOS_RA_UA_VERSION secret the build stays softcore.
+      - name: Embed the RetroAchievements client identity
+        env:
+          IOS_RA_UA_VERSION: ${{ secrets.IOS_RA_UA_VERSION }}
+        run: bash .github/workflows/scripts/common/write-ra-ua-secret.sh
+
+      - name: Build unsigned IPA
+        run: ./platforms/ios/scripts/build-ios-ipa.sh
+
+      # The SDK the app was linked against is what iOS reads to decide native vs letterboxed.
+      - name: Verify the app is linked for iPhone Duo's native screen
+        run: |
+          plist=platforms/ios/build/device/Release-iphoneos/ARMSX2iOS.app/Info.plist
+          sdk="$(/usr/libexec/PlistBuddy -c 'Print :DTPlatformVersion' "$plist")"
+          echo "DTSDKName=$(/usr/libexec/PlistBuddy -c 'Print :DTSDKName' "$plist") DTXcode=$(/usr/libexec/PlistBuddy -c 'Print :DTXcode' "$plist")"
+          printf '%s\n27.1\n' "$sdk" | sort -V -C -r || { echo "::error::app was linked against iOS SDK $sdk, older than 27.1"; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print :UILaunchScreen' "$plist" >/dev/null || { echo "::error::UILaunchScreen is missing; iOS would letterbox the app"; exit 1; }
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: ARMSX2-iOS-Duo
+          path: platforms/ios/build/device/ARMSX2-iOS-unsigned.ipa
+          if-no-files-found: error
